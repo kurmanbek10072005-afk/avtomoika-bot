@@ -71,7 +71,18 @@ function looksLikeBookingRequest(text) {
 // --- Отправка ответа клиенту в WhatsApp через GREEN-API ---
 async function sendWhatsAppMessage(chatId, message) {
   const url = `${GREEN_API_BASE}/sendMessage/${GREEN_API_TOKEN}`;
-  await axios.post(url, { chatId, message });
+  console.log(`[sendWhatsAppMessage] Отправка сообщения в chatId=${chatId}: "${message}"`);
+  try {
+    const response = await axios.post(url, { chatId, message });
+    console.log("[sendWhatsAppMessage] Ответ GREEN-API:", JSON.stringify(response.data));
+    return response.data;
+  } catch (err) {
+    console.error(
+      "[sendWhatsAppMessage] Ошибка при отправке сообщения в GREEN-API:",
+      err?.response?.data ? JSON.stringify(err.response.data) : err
+    );
+    throw err;
+  }
 }
 
 // --- Уведомление менеджеру в Телеграм о новой заявке ---
@@ -90,35 +101,58 @@ async function notifyTelegram(clientChatId, senderName, messageText) {
 async function generateReply(chatId, userMessage) {
   pushToHistory(chatId, "user", userMessage);
 
-  const response = await axios.post(
-    "https://api.groq.com/openai/v1/chat/completions",
-    {
-      model: GROQ_MODEL,
-      max_tokens: 500,
-      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...getHistory(chatId)],
-    },
-    { headers: { Authorization: `Bearer ${GROQ_API_KEY}` } }
-  );
+  console.log(`[generateReply] Генерация ответа для chatId=${chatId}, сообщение: "${userMessage}"`);
 
-  const replyText = response.data.choices[0].message.content;
-  pushToHistory(chatId, "assistant", replyText);
-  return replyText;
+  try {
+    const response = await axios.post(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        model: GROQ_MODEL,
+        max_tokens: 500,
+        messages: [{ role: "system", content: SYSTEM_PROMPT }, ...getHistory(chatId)],
+      },
+      { headers: { Authorization: `Bearer ${GROQ_API_KEY}` } }
+    );
+
+    const replyText = response.data.choices[0].message.content;
+    pushToHistory(chatId, "assistant", replyText);
+    console.log(`[generateReply] Ответ сгенерирован для chatId=${chatId}: "${replyText}"`);
+    return replyText;
+  } catch (err) {
+    console.error(
+      "[generateReply] Ошибка при обращении к Groq API:",
+      err?.response?.data ? JSON.stringify(err.response.data) : err
+    );
+    throw err;
+  }
 }
 
 // --- Вебхук от GREEN-API на входящие сообщения WhatsApp ---
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200); // отвечаем сразу, обработку делаем асинхронно
 
+  console.log("[/webhook] Получен вебхук:", JSON.stringify(req.body));
+
   try {
     const body = req.body;
-    if (body.typeWebhook !== "incomingMessageReceived") return;
+    if (body.typeWebhook !== "incomingMessageReceived") {
+      console.log(`[/webhook] Пропускаем, typeWebhook=${body.typeWebhook}`);
+      return;
+    }
 
     const chatId = body.senderData?.chatId;
     const senderName = body.senderData?.senderName;
     const messageType = body.messageData?.typeMessage;
 
+    console.log(`[/webhook] chatId=${chatId}, senderName=${senderName}, messageType=${messageType}`);
+
     if (messageType !== "textMessage" && messageType !== "extendedTextMessage") {
-      await sendWhatsAppMessage(chatId, "Пока умею отвечать только на текстовые сообщения 🙂");
+      try {
+        console.log("[/webhook] Сообщение не текстовое, отправляем стандартный ответ");
+        await sendWhatsAppMessage(chatId, "Пока умею отвечать только на текстовые сообщения 🙂");
+      } catch (err) {
+        console.error("[/webhook] Ошибка при отправке стандартного ответа:", err);
+      }
       return;
     }
 
@@ -126,25 +160,47 @@ app.post("/webhook", async (req, res) => {
       body.messageData?.textMessageData?.textMessage ||
       body.messageData?.extendedTextMessageData?.text;
 
-    if (!chatId || !userText) return;
+    if (!chatId || !userText) {
+      console.log("[/webhook] Нет chatId или userText, прекращаем обработку");
+      return;
+    }
 
     // Если это похоже на просьбу о записи — уведомляем менеджера в Телеграм и сохраняем в список
     if (looksLikeBookingRequest(userText)) {
-      await notifyTelegram(chatId, senderName, userText);
-      saveBooking({
-        date: new Date().toLocaleString("ru-RU", { timeZone: "Asia/Bishkek" }),
-        chatId,
-        senderName: senderName || "не указан",
-        message: userText,
-        status: "новая",
-      });
+      try {
+        console.log("[/webhook] Похоже на заявку на запись, уведомляем Телеграм");
+        await notifyTelegram(chatId, senderName, userText);
+        saveBooking({
+          date: new Date().toLocaleString("ru-RU", { timeZone: "Asia/Bishkek" }),
+          chatId,
+          senderName: senderName || "не указан",
+          message: userText,
+          status: "новая",
+        });
+      } catch (err) {
+        console.error("[/webhook] Ошибка при уведомлении Телеграм или сохранении заявки:", err);
+      }
     }
 
     // В любом случае бот отвечает клиенту сам
-    const reply = await generateReply(chatId, userText);
-    await sendWhatsAppMessage(chatId, reply);
+    let reply;
+    try {
+      console.log("[/webhook] Генерируем ответ через generateReply");
+      reply = await generateReply(chatId, userText);
+    } catch (err) {
+      console.error("[/webhook] Ошибка при генерации ответа (generateReply):", err);
+      return;
+    }
+
+    try {
+      console.log("[/webhook] Отправляем ответ клиенту через sendWhatsAppMessage");
+      await sendWhatsAppMessage(chatId, reply);
+      console.log("[/webhook] Ответ клиенту успешно отправлен");
+    } catch (err) {
+      console.error("[/webhook] Ошибка при отправке ответа клиенту (sendWhatsAppMessage):", err);
+    }
   } catch (err) {
-    console.error("Ошибка обработки сообщения:", err?.response?.data || err.message);
+    console.error("Ошибка обработки сообщения:", err);
   }
 });
 
