@@ -27,8 +27,8 @@ const app = express();
 app.use(express.json());
 
 // --- Настройки из .env ---
-const XAI_API_KEY = process.env.XAI_API_KEY;
-const XAI_MODEL = "grok-4.3";
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL = "llama-3.3-70b-versatile";
 
 const GREEN_API_ID = process.env.GREEN_API_ID_INSTANCE;
 const GREEN_API_TOKEN = process.env.GREEN_API_TOKEN_INSTANCE;
@@ -91,13 +91,13 @@ async function generateReply(chatId, userMessage) {
   pushToHistory(chatId, "user", userMessage);
 
   const response = await axios.post(
-    "https://api.x.ai/v1/chat/completions",
+    "https://api.groq.com/openai/v1/chat/completions",
     {
-      model: XAI_MODEL,
+      model: GROQ_MODEL,
       max_tokens: 500,
       messages: [{ role: "system", content: SYSTEM_PROMPT }, ...getHistory(chatId)],
     },
-    { headers: { Authorization: `Bearer ${XAI_API_KEY}` } }
+    { headers: { Authorization: `Bearer ${GROQ_API_KEY}` } }
   );
 
   const replyText = response.data.choices[0].message.content;
