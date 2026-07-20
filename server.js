@@ -94,6 +94,9 @@ const BOOKING_KEYWORDS = (process.env.BOOKING_KEYWORDS || "запись,запи
   .map((w) => w.trim().toLowerCase())
   .filter(Boolean);
 
+// Через сколько часов после отметки "Готово" спрашивать отзыв у клиента
+const FEEDBACK_DELAY_HOURS = Number(process.env.FEEDBACK_DELAY_HOURS || 1);
+
 const conversations = new Map();
 const MAX_HISTORY_MESSAGES = 20;
 
@@ -111,6 +114,10 @@ function pushToHistory(chatId, role, content) {
 }
 
 const awaitingReschedule = new Map();
+
+// Клиенты, у которых заявка ещё не подтверждена — их следующие сообщения
+// (время, номер машины и т.д.) тоже пересылаем менеджеру в Телеграм
+const pendingBookings = new Map(); // chatId -> bookingId
 
 function looksLikeBookingRequest(text) {
   const lower = text.toLowerCase();
@@ -166,6 +173,10 @@ async function notifyTelegram(bookingId, clientChatId, senderName, messageText) 
       [
         { text: "✅ Подтвердить", callback_data: `confirm:${bookingId}` },
         { text: "🔁 Перенести", callback_data: `reschedule:${bookingId}` },
+      ],
+      [
+        { text: "🏁 Готово", callback_data: `done:${bookingId}` },
+        { text: "❌ Отклонить", callback_data: `reject:${bookingId}` },
       ],
     ],
   };
@@ -226,7 +237,21 @@ app.post("/webhook", async (req, res) => {
         status: "новая",
       });
       markClientBooking(chatId);
+      pendingBookings.set(chatId, bookingId);
       await notifyTelegram(bookingId, chatId, senderName, userText);
+    } else if (pendingBookings.has(chatId)) {
+      // Клиент уже начал запись раньше — это уточнение (время, номер машины и т.п.)
+      const bookingId = pendingBookings.get(chatId);
+      const bookings = loadBookings();
+      const booking = bookings.find((b) => String(b.id) === String(bookingId));
+      if (booking) {
+        booking.message = `${booking.message}\n+ ${userText}`;
+        saveBookingsList(bookings);
+        await sendTelegramMessage(
+          TELEGRAM_CHAT_ID,
+          `🔎 Уточнение по заявке №${bookingId} от ${senderName || booking.senderName}:\n${userText}`
+        );
+      }
     }
 
     const reply = await generateReply(chatId, userText);
@@ -261,6 +286,7 @@ app.post("/telegram-webhook", async (req, res) => {
           booking.chatId,
           "Здравствуйте! Ваша запись подтверждена ✅ Ждём вас в указанное время."
         );
+        pendingBookings.delete(booking.chatId);
         await answerCallbackQuery(cq.id, "Подтверждено");
         await sendTelegramMessage(
           tgChatId,
@@ -272,6 +298,30 @@ app.post("/telegram-webhook", async (req, res) => {
         await sendTelegramMessage(
           tgChatId,
           `🔁 Напишите обычным сообщением новое время для клиента ${booking.senderName} (заявка №${booking.id}). Я перешлю его клиенту.`
+        );
+      } else if (action === "reject") {
+        booking.status = "отклонена, ждём предложение клиента";
+        saveBookingsList(bookings);
+        pendingBookings.set(booking.chatId, booking.id);
+        await sendWhatsAppMessage(
+          booking.chatId,
+          "Здравствуйте! К сожалению, это время недоступно. Пожалуйста, предложите другое удобное для вас время."
+        );
+        await answerCallbackQuery(cq.id, "Отклонено");
+        await sendTelegramMessage(
+          tgChatId,
+          `❌ Заявка №${booking.id} (${booking.senderName}) отклонена. Клиенту предложено назвать другое время — сообщу, когда ответит.`
+        );
+      } else if (action === "done") {
+        booking.status = "выполнена 🏁";
+        booking.completedAt = Date.now();
+        booking.feedbackSent = false;
+        saveBookingsList(bookings);
+        pendingBookings.delete(booking.chatId);
+        await answerCallbackQuery(cq.id, "Отмечено как готово");
+        await sendTelegramMessage(
+          tgChatId,
+          `🏁 Заявка №${booking.id} (${booking.senderName}) отмечена как выполненная. Через ${FEEDBACK_DELAY_HOURS} ч. спрошу у клиента отзыв.`
         );
       }
       return;
@@ -307,6 +357,34 @@ app.post("/telegram-webhook", async (req, res) => {
 });
 
 app.get("/", (req, res) => res.send("WhatsApp AI bot работает."));
+
+// --- Раз в 15 минут проверяем: не пора ли спросить отзыв у клиента ---
+async function checkAndSendFeedback() {
+  try {
+    const bookings = loadBookings();
+    const delayMs = FEEDBACK_DELAY_HOURS * 60 * 60 * 1000;
+    let changed = false;
+
+    for (const b of bookings) {
+      if (
+        b.completedAt &&
+        !b.feedbackSent &&
+        Date.now() - b.completedAt >= delayMs
+      ) {
+        await sendWhatsAppMessage(
+          b.chatId,
+          "Здравствуйте! Спасибо, что выбрали нас 🙂 Как всё прошло, понравилось ли обслуживание? Будем рады вашему отзыву!"
+        );
+        b.feedbackSent = true;
+        changed = true;
+      }
+    }
+
+    if (changed) saveBookingsList(bookings);
+  } catch (err) {
+    console.error("Ошибка при отправке запроса на отзыв:", err?.response?.data || err.message);
+  }
+}
 
 app.get("/bookings", (req, res) => {
   if (req.query.key !== BOOKINGS_SECRET) {
@@ -416,4 +494,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Сервер запущен на порту ${PORT}`);
   setupTelegramWebhook();
+  setInterval(checkAndSendFeedback, 15 * 60 * 1000); // проверка каждые 15 минут
 });
