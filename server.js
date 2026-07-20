@@ -5,11 +5,12 @@ import fs from "fs";
 
 dotenv.config();
 
-// --- Файл, куда сохраняется список заявок на запись (переживает перезапуск) ---
+// --- Файлы данных (переживают перезапуск) ---
 const BOOKINGS_FILE = "./bookings.json";
 const CLIENTS_FILE = "./clients.json";
+const STATE_FILE = "./state.json"; // для утренней сводки (какой день уже отправляли)
 const BOOKINGS_SECRET = process.env.BOOKINGS_SECRET || "moika123";
-const PUBLIC_URL = process.env.PUBLIC_URL || ""; // например https://avtomoika-bot-production.up.railway.app
+const PUBLIC_URL = process.env.PUBLIC_URL || "";
 
 function loadBookings() {
   try {
@@ -41,6 +42,18 @@ function saveClients(clients) {
   fs.writeFileSync(CLIENTS_FILE, JSON.stringify(clients, null, 2), "utf-8");
 }
 
+function loadState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveState(state) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
+}
+
 function recordClientMessage(chatId, senderName, text) {
   const clients = loadClients();
   const now = new Date().toLocaleString("ru-RU", { timeZone: "Asia/Bishkek" });
@@ -65,12 +78,16 @@ function recordClientMessage(chatId, senderName, text) {
   return client;
 }
 
+// Возвращает true, если это уже 4-й (или больше) визит — постоянный клиент
 function markClientBooking(chatId) {
   const clients = loadClients();
+  let isLoyal = false;
   if (clients[chatId]) {
     clients[chatId].bookingsCount += 1;
+    isLoyal = clients[chatId].bookingsCount >= 4;
     saveClients(clients);
   }
+  return isLoyal;
 }
 
 const app = express();
@@ -78,6 +95,7 @@ app.use(express.json());
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL = "openai/gpt-oss-120b";
+const GROQ_WHISPER_MODEL = "whisper-large-v3";
 
 const GREEN_API_ID = process.env.GREEN_API_ID_INSTANCE;
 const GREEN_API_TOKEN = process.env.GREEN_API_TOKEN_INSTANCE;
@@ -86,8 +104,20 @@ const GREEN_API_BASE = `https://api.green-api.com/waInstance${GREEN_API_ID}`;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-const SYSTEM_PROMPT =
+const SYSTEM_PROMPT_BASE =
   process.env.SYSTEM_PROMPT || "Ты — вежливый ассистент компании. Отвечай кратко.";
+
+const BOOKING_INSTRUCTIONS = `
+
+При обращении клиента с просьбой записаться ОБЯЗАТЕЛЬНО уточняй по порядку, если этого нет в сообщении:
+1) какая услуга нужна (мойка, тонировка, химчистка, полировка и т.д.)
+2) желаемая дата и время
+3) номер машины (гос. номер)
+Пока не получишь все три пункта — не считай запись оформленной, задавай уточняющие вопросы по одному.
+Как только получишь все данные, подведи итог клиенту в формате:
+"Записал(а) вас: услуга — ..., время — ..., машина — ...".`;
+
+const SYSTEM_PROMPT = SYSTEM_PROMPT_BASE + BOOKING_INSTRUCTIONS;
 
 const BOOKING_KEYWORDS = (process.env.BOOKING_KEYWORDS || "запись,записать,записаться")
   .split(",")
@@ -114,9 +144,6 @@ function pushToHistory(chatId, role, content) {
 }
 
 const awaitingReschedule = new Map();
-
-// Клиенты, у которых заявка ещё не подтверждена — их следующие сообщения
-// (время, номер машины и т.д.) тоже пересылаем менеджеру в Телеграм
 const pendingBookings = new Map(); // chatId -> bookingId
 
 function looksLikeBookingRequest(text) {
@@ -160,11 +187,11 @@ async function setupTelegramWebhook() {
   }
 }
 
-async function notifyTelegram(bookingId, clientChatId, senderName, messageText) {
+async function notifyTelegram(bookingId, clientChatId, senderName, messageText, isLoyal) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
   const text =
     `📥 Новая заявка на запись (№${bookingId})\n\n` +
-    `Клиент: ${senderName || "не указан"}\n` +
+    `Клиент: ${senderName || "не указан"}${isLoyal ? " 🎁 (постоянный клиент)" : ""}\n` +
     `WhatsApp: ${clientChatId}\n` +
     `Сообщение: ${messageText}`;
 
@@ -202,6 +229,74 @@ async function generateReply(chatId, userMessage) {
   return replyText;
 }
 
+// --- Распознавание голосовых сообщений через Groq Whisper ---
+async function transcribeVoice(fileUrl) {
+  const audioResponse = await axios.get(fileUrl, { responseType: "arraybuffer" });
+
+  const FormData = (await import("form-data")).default;
+  const form = new FormData();
+  form.append("file", Buffer.from(audioResponse.data), "voice.ogg");
+  form.append("model", GROQ_WHISPER_MODEL);
+  form.append("language", "ru");
+
+  const response = await axios.post(
+    "https://api.groq.com/openai/v1/audio/transcriptions",
+    form,
+    {
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        ...form.getHeaders(),
+      },
+    }
+  );
+
+  return response.data.text;
+}
+
+// --- Обработка одного текста от клиента (общая для текста и распознанного голоса) ---
+async function handleClientText(chatId, senderName, userText) {
+  recordClientMessage(chatId, senderName, userText);
+
+  if (looksLikeBookingRequest(userText)) {
+    const bookingId = Date.now();
+    saveBooking({
+      id: bookingId,
+      date: new Date().toLocaleString("ru-RU", { timeZone: "Asia/Bishkek" }),
+      chatId,
+      senderName: senderName || "не указан",
+      message: userText,
+      status: "новая",
+    });
+    const isLoyal = markClientBooking(chatId);
+    pendingBookings.set(chatId, bookingId);
+    await notifyTelegram(bookingId, chatId, senderName, userText, isLoyal);
+  } else if (pendingBookings.has(chatId)) {
+    const bookingId = pendingBookings.get(chatId);
+    const bookings = loadBookings();
+    const booking = bookings.find((b) => String(b.id) === String(bookingId));
+    if (booking) {
+      booking.message = `${booking.message}\n+ ${userText}`;
+      saveBookingsList(bookings);
+      await sendTelegramMessage(
+        TELEGRAM_CHAT_ID,
+        `🔎 Уточнение по заявке №${bookingId} от ${senderName || booking.senderName}:\n${userText}`
+      );
+    }
+  } else {
+    // Проверка: это цифра 1-5 в ответ на запрос отзыва?
+    const trimmed = userText.trim();
+    if (/^[1-5]$/.test(trimmed)) {
+      await sendTelegramMessage(
+        TELEGRAM_CHAT_ID,
+        `⭐ Клиент ${senderName || chatId} поставил оценку: ${trimmed}/5`
+      );
+    }
+  }
+
+  const reply = await generateReply(chatId, userText);
+  await sendWhatsAppMessage(chatId, reply);
+}
+
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
 
@@ -213,49 +308,34 @@ app.post("/webhook", async (req, res) => {
     const senderName = body.senderData?.senderName;
     const messageType = body.messageData?.typeMessage;
 
-    if (messageType !== "textMessage" && messageType !== "extendedTextMessage") {
-      await sendWhatsAppMessage(chatId, "Пока умею отвечать только на текстовые сообщения 🙂");
+    if (!chatId) return;
+
+    if (messageType === "textMessage" || messageType === "extendedTextMessage") {
+      const userText =
+        body.messageData?.textMessageData?.textMessage ||
+        body.messageData?.extendedTextMessageData?.text;
+      if (!userText) return;
+      await handleClientText(chatId, senderName, userText);
       return;
     }
 
-    const userText =
-      body.messageData?.textMessageData?.textMessage ||
-      body.messageData?.extendedTextMessageData?.text;
-
-    if (!chatId || !userText) return;
-
-    recordClientMessage(chatId, senderName, userText);
-
-    if (looksLikeBookingRequest(userText)) {
-      const bookingId = Date.now();
-      saveBooking({
-        id: bookingId,
-        date: new Date().toLocaleString("ru-RU", { timeZone: "Asia/Bishkek" }),
-        chatId,
-        senderName: senderName || "не указан",
-        message: userText,
-        status: "новая",
-      });
-      markClientBooking(chatId);
-      pendingBookings.set(chatId, bookingId);
-      await notifyTelegram(bookingId, chatId, senderName, userText);
-    } else if (pendingBookings.has(chatId)) {
-      // Клиент уже начал запись раньше — это уточнение (время, номер машины и т.п.)
-      const bookingId = pendingBookings.get(chatId);
-      const bookings = loadBookings();
-      const booking = bookings.find((b) => String(b.id) === String(bookingId));
-      if (booking) {
-        booking.message = `${booking.message}\n+ ${userText}`;
-        saveBookingsList(bookings);
-        await sendTelegramMessage(
-          TELEGRAM_CHAT_ID,
-          `🔎 Уточнение по заявке №${bookingId} от ${senderName || booking.senderName}:\n${userText}`
-        );
+    if (messageType === "audioMessage" || messageType === "voiceMessage" || messageType === "ptt") {
+      const fileUrl = body.messageData?.fileMessageData?.downloadUrl;
+      if (!fileUrl) {
+        await sendWhatsAppMessage(chatId, "Не смог обработать голосовое сообщение, попробуйте написать текстом 🙂");
+        return;
       }
+      try {
+        const transcribed = await transcribeVoice(fileUrl);
+        await handleClientText(chatId, senderName, transcribed);
+      } catch (err) {
+        console.error("Ошибка распознавания голоса:", err?.response?.data || err.message);
+        await sendWhatsAppMessage(chatId, "Не удалось распознать голосовое сообщение, напишите, пожалуйста, текстом 🙂");
+      }
+      return;
     }
 
-    const reply = await generateReply(chatId, userText);
-    await sendWhatsAppMessage(chatId, reply);
+    await sendWhatsAppMessage(chatId, "Пока умею отвечать только на текстовые и голосовые сообщения 🙂");
   } catch (err) {
     console.error("Ошибка обработки сообщения:", err?.response?.data || err.message);
   }
@@ -321,7 +401,7 @@ app.post("/telegram-webhook", async (req, res) => {
         await answerCallbackQuery(cq.id, "Отмечено как готово");
         await sendTelegramMessage(
           tgChatId,
-          `🏁 Заявка №${booking.id} (${booking.senderName}) отмечена как выполненная. Через ${FEEDBACK_DELAY_HOURS} ч. спрошу у клиента отзыв.`
+          `🏁 Заявка №${booking.id} (${booking.senderName}) отмечена как выполненная. Через ${FEEDBACK_DELAY_HOURS} ч. спрошу у клиента отзыв (ответом 1-5).`
         );
       }
       return;
@@ -366,14 +446,10 @@ async function checkAndSendFeedback() {
     let changed = false;
 
     for (const b of bookings) {
-      if (
-        b.completedAt &&
-        !b.feedbackSent &&
-        Date.now() - b.completedAt >= delayMs
-      ) {
+      if (b.completedAt && !b.feedbackSent && Date.now() - b.completedAt >= delayMs) {
         await sendWhatsAppMessage(
           b.chatId,
-          "Здравствуйте! Спасибо, что выбрали нас 🙂 Как всё прошло, понравилось ли обслуживание? Будем рады вашему отзыву!"
+          "Здравствуйте! Спасибо, что выбрали нас 🙂 Оцените, пожалуйста, обслуживание одним числом от 1 до 5 (5 — отлично)."
         );
         b.feedbackSent = true;
         changed = true;
@@ -383,6 +459,36 @@ async function checkAndSendFeedback() {
     if (changed) saveBookingsList(bookings);
   } catch (err) {
     console.error("Ошибка при отправке запроса на отзыв:", err?.response?.data || err.message);
+  }
+}
+
+// --- Раз в 15 минут проверяем: не пора ли отправить утреннюю сводку (в 8:00) ---
+async function checkMorningSummary() {
+  try {
+    const now = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Bishkek" }));
+    const today = now.toISOString().slice(0, 10);
+    const state = loadState();
+
+    if (now.getHours() !== 8 || state.lastSummaryDate === today) return;
+
+    const bookings = loadBookings();
+    const active = bookings.filter(
+      (b) => !b.status.startsWith("выполнена") && !b.status.startsWith("отклонена")
+    );
+
+    const text =
+      `🌅 Доброе утро! Сводка на сегодня\n\n` +
+      `Активных заявок: ${active.length}\n\n` +
+      (active
+        .slice(0, 15)
+        .map((b) => `• ${b.senderName} — ${b.message.split("\n")[0]} (статус: ${b.status})`)
+        .join("\n") || "Заявок нет");
+
+    await sendTelegramMessage(TELEGRAM_CHAT_ID, text);
+    state.lastSummaryDate = today;
+    saveState(state);
+  } catch (err) {
+    console.error("Ошибка при отправке утренней сводки:", err?.response?.data || err.message);
   }
 }
 
@@ -422,7 +528,7 @@ app.get("/bookings", (req, res) => {
         </style>
       </head>
       <body>
-        <p><a href="/clients?key=${BOOKINGS_SECRET}">→ Открыть список клиентов</a></p>
+        <p><a href="/clients?key=${BOOKINGS_SECRET}">→ Открыть список клиентов</a> &nbsp;|&nbsp; <a href="/export?key=${BOOKINGS_SECRET}">→ Скачать CSV</a></p>
         <h2>Заявки на запись (${bookings.length})</h2>
         <table>
           <tr><th>№</th><th>Дата</th><th>Имя</th><th>WhatsApp</th><th>Сообщение</th><th>Статус</th></tr>
@@ -446,7 +552,7 @@ app.get("/clients", (req, res) => {
     .map(
       (c) => `
       <tr>
-        <td>${c.name}</td>
+        <td>${c.name}${c.bookingsCount >= 4 ? " 🎁" : ""}</td>
         <td>${c.chatId}</td>
         <td>${c.firstSeen}</td>
         <td>${c.lastSeen}</td>
@@ -476,8 +582,8 @@ app.get("/clients", (req, res) => {
         </style>
       </head>
       <body>
-        <p><a href="/bookings?key=${BOOKINGS_SECRET}">→ Открыть список заявок</a></p>
-        <h2>Клиенты (${clients.length})</h2>
+        <p><a href="/bookings?key=${BOOKINGS_SECRET}">→ Открыть список заявок</a> &nbsp;|&nbsp; <a href="/export?key=${BOOKINGS_SECRET}">→ Скачать CSV</a></p>
+        <h2>Клиенты (${clients.length}) &nbsp; 🎁 = постоянный клиент (4+ заявок)</h2>
         <table>
           <tr>
             <th>Имя</th><th>WhatsApp</th><th>Первое обращение</th><th>Последнее обращение</th>
@@ -490,9 +596,32 @@ app.get("/clients", (req, res) => {
   `);
 });
 
+// --- Выгрузка заявок в CSV (открывается в Excel) ---
+app.get("/export", (req, res) => {
+  if (req.query.key !== BOOKINGS_SECRET) {
+    return res.status(403).send("Доступ запрещён. Добавьте правильный ?key=... в адрес.");
+  }
+
+  const bookings = loadBookings();
+  const escape = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const header = ["№", "Дата", "Имя", "WhatsApp", "Сообщение", "Статус"].join(";");
+  const rows = bookings
+    .map((b, i) =>
+      [bookings.length - i, b.date, b.senderName, b.chatId, b.message, b.status]
+        .map(escape)
+        .join(";")
+    )
+    .join("\n");
+
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", "attachment; filename=zayavki.csv");
+  res.send("\uFEFF" + header + "\n" + rows);
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Сервер запущен на порту ${PORT}`);
   setupTelegramWebhook();
-  setInterval(checkAndSendFeedback, 15 * 60 * 1000); // проверка каждые 15 минут
+  setInterval(checkAndSendFeedback, 15 * 60 * 1000);
+  setInterval(checkMorningSummary, 15 * 60 * 1000);
 });
