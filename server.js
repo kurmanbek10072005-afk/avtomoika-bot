@@ -237,7 +237,7 @@ async function transcribeVoice(fileUrl) {
   const form = new FormData();
   form.append("file", Buffer.from(audioResponse.data), "voice.ogg");
   form.append("model", GROQ_WHISPER_MODEL);
-  form.append("language", "ru");
+  // Язык не указываем намеренно — модель сама определяет (клиенты пишут и на русском, и на кыргызском)
 
   const response = await axios.post(
     "https://api.groq.com/openai/v1/audio/transcriptions",
